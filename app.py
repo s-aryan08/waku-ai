@@ -1,7 +1,7 @@
 """Waku AI Companion - Flask Application.
 
-Serves the modern chat interface and handles real-time dialogue and streaming
-with Waku using the Google Agent Development Kit (ADK).
+Serves the chat interface and streams Google ADK responses with reliable,
+thread-safe cancellation.
 """
 
 import asyncio
@@ -10,115 +10,193 @@ import logging
 import os
 import queue
 import threading
-from typing import Dict
-from flask import Flask, Response, jsonify, render_template, request
+from dataclasses import dataclass
+from typing import Optional
+
 from dotenv import load_dotenv
-from google.adk.runners import InMemoryRunner, RunConfig
+from flask import Flask, Response, jsonify, render_template, request, stream_with_context
+from google.adk.agents.run_config import RunConfig, StreamingMode
+from google.adk.runners import InMemoryRunner
 from google.genai import types
 
-# Load environment variables from .env file if available
+# ---------------------------------------------------------------------------
+# Configuration
+# ---------------------------------------------------------------------------
+
 load_dotenv()
 
-# Fallback: check standard Cloud Shell credential locations if GEMINI_API_KEY is not set
-if "GEMINI_API_KEY" not in os.environ:
-    for fallback_file in [
+# Optional fallback locations used in the original Cloud Shell setup.
+if not os.environ.get("GEMINI_API_KEY"):
+    for fallback_file in (
         os.path.expanduser("~/gemini_key.txt"),
         os.path.expanduser("~/api_key.txt"),
-    ]:
-        if os.path.exists(fallback_file):
-            try:
-                with open(fallback_file, "r", encoding="utf-8") as f:
-                    key = f.read().strip()
-                    if key:
-                        os.environ["GEMINI_API_KEY"] = key
-                        break
-            except OSError:
-                pass
+    ):
+        try:
+            if os.path.isfile(fallback_file):
+                key = open(fallback_file, "r", encoding="utf-8").read().strip()
+                if key:
+                    os.environ["GEMINI_API_KEY"] = key
+                    break
+        except OSError:
+            pass
 
-# Configure logging
 logging.basicConfig(
-    level=logging.INFO,
+    level=os.environ.get("LOG_LEVEL", "INFO").upper(),
     format="%(asctime)s [%(levelname)s] %(name)s: %(message)s",
 )
 logger = logging.getLogger("waku_ai")
 
 app = Flask(__name__)
 
-# Initialize Google ADK runner with character agent
+# ---------------------------------------------------------------------------
+# Google ADK runner
+# ---------------------------------------------------------------------------
+
 runner = None
-StreamingMode = None
 
 try:
     import character
-    StreamingMode = RunConfig.model_fields["streaming_mode"].annotation
 
     runner = InMemoryRunner(
         agent=character.root_agent,
         app_name="Waku AI",
     )
-    logger.info("ADK InMemoryRunner initialized successfully with agent: %s", character.root_agent.name)
-except Exception as e:
-    logger.warning("Could not initialize ADK Runner: %s", e)
+    logger.info(
+        "ADK InMemoryRunner initialized with agent: %s",
+        character.root_agent.name,
+    )
+except Exception:
+    logger.exception("Could not initialize the Google ADK runner")
 
-# Thread-safe mapping of active session IDs to their abort events
-active_aborts: Dict[str, asyncio.Event] = {}
-aborts_lock = threading.Lock()
+
+# ---------------------------------------------------------------------------
+# Active stream registry
+#
+# IMPORTANT:
+# asyncio.Event is bound to the event loop that owns it. Flask's stop route
+# runs in a different thread, so it must NOT call event.set() directly.
+# Instead, it schedules event.set() with loop.call_soon_threadsafe().
+# ---------------------------------------------------------------------------
+
+@dataclass
+class ActiveRun:
+    cancel_requested: threading.Event
+    loop: Optional[asyncio.AbstractEventLoop] = None
+    abort_signal: Optional[asyncio.Event] = None
+
+
+active_runs: dict[str, ActiveRun] = {}
+active_runs_lock = threading.Lock()
+
+
+def request_cancellation(session_id: str) -> bool:
+    """Request cancellation safely from any Flask/worker thread."""
+    with active_runs_lock:
+        active = active_runs.get(session_id)
+        if active is None:
+            return False
+
+        active.cancel_requested.set()
+
+        loop = active.loop
+        abort_signal = active.abort_signal
+
+        if loop is not None and abort_signal is not None and not loop.is_closed():
+            try:
+                loop.call_soon_threadsafe(abort_signal.set)
+            except RuntimeError:
+                # The worker's event loop may have closed during cleanup.
+                pass
+
+        return True
+
+
+def remove_active_run(session_id: str, active: ActiveRun) -> None:
+    """Remove a run only if it is still the registered run for this session."""
+    with active_runs_lock:
+        if active_runs.get(session_id) is active:
+            active_runs.pop(session_id, None)
 
 
 def build_prompt_with_locale(user_message: str, language: str) -> str:
-    """Formats the prompt with voice language context if non-English voice selected."""
-    if language.lower().startswith("hi"):
-        return f"[Voice: Hindi (hi-IN). Reply in natural conversational Hindi in Devanagari script. No asterisks or physical action descriptions]\n{user_message}"
-    if language.lower().startswith("en"):
-        return f"[Voice: English. Reply in natural conversational English. No asterisks or physical action descriptions]\n{user_message}"
-    if language:
-        return f"[Voice Locale: {language}. Reply in this language. No asterisks or physical action descriptions]\n{user_message}"
-    return user_message
+    """Add language instructions to the user's message."""
+    language = (language or "en-US").strip()
 
+    if language.lower().startswith("hi"):
+        instruction = (
+            "[Voice: Hindi (hi-IN). Reply in natural conversational Hindi "
+            "in Devanagari script. No asterisks or physical action descriptions.]\n"
+        )
+    elif language.lower().startswith("en"):
+        instruction = (
+            "[Voice: English. Reply in natural conversational English. "
+            "No asterisks or physical action descriptions.]\n"
+        )
+    else:
+        instruction = (
+            f"[Voice Locale: {language}. Reply in this language. "
+            "No asterisks or physical action descriptions.]\n"
+        )
+
+    return instruction + user_message
+
+
+async def get_or_create_session(session_id: str):
+    """Get the ADK session, creating it if this is the first message."""
+    adk_session = await runner.session_service.get_session(
+        app_name=runner.app_name,
+        user_id="inapp_user",
+        session_id=session_id,
+    )
+
+    if adk_session is None:
+        adk_session = await runner.session_service.create_session(
+            app_name=runner.app_name,
+            user_id="inapp_user",
+            session_id=session_id,
+        )
+
+    return adk_session
+
+
+def make_sse(payload: dict) -> str:
+    """Encode one Server-Sent Event using the existing frontend JSON format."""
+    return f"data: {json.dumps(payload, ensure_ascii=False)}\n\n"
+
+
+# ---------------------------------------------------------------------------
+# Pages and non-streaming chat
+# ---------------------------------------------------------------------------
 
 @app.route("/")
 def index():
-    """Renders the main Waku AI companion interface."""
     return render_template("index.html")
 
 
 @app.route("/chat", methods=["POST"])
 async def chat():
-    """Non-streaming chat endpoint returning complete JSON response."""
-    data = request.get_json(silent=True)
-    if not data or "message" not in data:
-        return jsonify({"error": "Missing 'message' in request body."}), 400
+    """Return a complete response as JSON (non-streaming endpoint)."""
+    data = request.get_json(silent=True) or {}
 
-    user_message = data.get("message", "").strip()
-    session_id = data.get("session_id", "default_session").strip()
-    language = data.get("language", "en-US").strip()
+    user_message = str(data.get("message", "")).strip()
+    session_id = str(data.get("session_id") or "default_session").strip()
+    language = str(data.get("language") or "en-US").strip()
 
     if not user_message:
         return jsonify({"error": "Message content cannot be empty."}), 400
 
     if runner is None:
-        return jsonify({
-            "response": "I'm having trouble connecting to my agent right now. Please check server configuration.",
-        }), 503
+        return jsonify({"error": "The AI agent is not initialized."}), 503
 
     try:
-        adk_session = await runner.session_service.get_session(
-            app_name=runner.app_name,
-            user_id="inapp_user",
-            session_id=session_id,
+        adk_session = await get_or_create_session(session_id)
+        content = types.Content(
+            role="user",
+            parts=[types.Part(text=build_prompt_with_locale(user_message, language))],
         )
-        if adk_session is None:
-            adk_session = await runner.session_service.create_session(
-                app_name=runner.app_name,
-                user_id="inapp_user",
-                session_id=session_id,
-            )
 
-        prompt_text = build_prompt_with_locale(user_message, language)
-        content = types.Content(role="user", parts=[types.Part(text=prompt_text)])
-        response_text = ""
+        response_parts = []
 
-        # In non-streaming mode, final event has complete text
         async for event in runner.run_async(
             user_id=adk_session.user_id,
             session_id=adk_session.id,
@@ -127,148 +205,263 @@ async def chat():
             if event.content and event.content.parts:
                 for part in event.content.parts:
                     if part.text:
-                        response_text += part.text
+                        response_parts.append(part.text)
 
+        response_text = "".join(response_parts).strip()
         if not response_text:
-            response_text = "I heard you, but I'm not sure how to respond just yet! Could you ask that again?"
+            response_text = (
+                "I heard you, but I'm not sure how to respond just yet. "
+                "Could you ask that again?"
+            )
 
         return jsonify({"response": response_text})
 
     except Exception as exc:
-        logger.error("Error in /chat: %s", exc, exc_info=True)
+        logger.exception("Error in /chat")
         return jsonify({
-            "response": "Sorry, my thoughts got a little tangled. Could you try asking me that again?",
+            "response": "Sorry, my thoughts got a little tangled. Please try again.",
             "error": str(exc),
-        }), 200
+        }), 500
 
+
+# ---------------------------------------------------------------------------
+# Streaming chat with cancellation
+# ---------------------------------------------------------------------------
 
 @app.route("/chat/stream", methods=["POST"])
 def chat_stream():
-    """Real-time SSE streaming endpoint with chunk-level cancellation support."""
+    """Stream response chunks over SSE and support the Stop button."""
     data = request.get_json(silent=True) or {}
-    user_message = data.get("message", "").strip()
-    session_id = data.get("session_id", "default_session").strip()
-    language = data.get("language", "en-US").strip()
+
+    user_message = str(data.get("message", "")).strip()
+    session_id = str(data.get("session_id") or "default_session").strip()
+    language = str(data.get("language") or "en-US").strip()
 
     if not user_message:
         return jsonify({"error": "Message content cannot be empty."}), 400
 
     if runner is None:
-        return jsonify({"error": "Runner not initialized."}), 503
+        return jsonify({"error": "The AI agent is not initialized."}), 503
+
+    if not session_id:
+        return jsonify({"error": "A valid session_id is required."}), 400
 
     def generate_events():
-        q: queue.Queue = queue.Queue()
+        event_queue: queue.Queue = queue.Queue()
         sentinel = object()
-        abort_event = asyncio.Event()
+        active = ActiveRun(cancel_requested=threading.Event())
 
-        with aborts_lock:
-            active_aborts[session_id] = abort_event
+        # Register before starting the worker so an immediate Stop request
+        # can find this generation.
+        with active_runs_lock:
+            previous = active_runs.get(session_id)
+            if previous is not None:
+                previous.cancel_requested.set()
+                if previous.loop and previous.abort_signal and not previous.loop.is_closed():
+                    try:
+                        previous.loop.call_soon_threadsafe(previous.abort_signal.set)
+                    except RuntimeError:
+                        pass
+            active_runs[session_id] = active
 
         def worker():
-            async def run():
-                try:
-                    adk_session = await runner.session_service.get_session(
-                        app_name=runner.app_name,
-                        user_id="inapp_user",
-                        session_id=session_id,
-                    )
-                    if adk_session is None:
-                        adk_session = await runner.session_service.create_session(
-                            app_name=runner.app_name,
-                            user_id="inapp_user",
-                            session_id=session_id,
-                        )
+            async def run_agent():
+                loop = asyncio.get_running_loop()
+                abort_signal = asyncio.Event()
 
-                    prompt_text = build_prompt_with_locale(user_message, language)
-                    content = types.Content(role="user", parts=[types.Part(text=prompt_text)])
-                    run_cfg = RunConfig(streaming_mode=StreamingMode.SSE)
-                    full_text = ""
+                # Publish the loop-owned asyncio.Event for the stop endpoint.
+                with active_runs_lock:
+                    active.loop = loop
+                    active.abort_signal = abort_signal
+                    already_cancelled = active.cancel_requested.is_set()
+
+                if already_cancelled:
+                    abort_signal.set()
+
+                full_text = ""
+                final_response_seen = False
+
+                try:
+                    adk_session = await get_or_create_session(session_id)
+
+                    if active.cancel_requested.is_set():
+                        abort_signal.set()
+                        event_queue.put({"type": "cancelled"})
+                        return
+
+                    content = types.Content(
+                        role="user",
+                        parts=[
+                            types.Part(
+                                text=build_prompt_with_locale(user_message, language)
+                            )
+                        ],
+                    )
+                    run_config = RunConfig(streaming_mode=StreamingMode.SSE)
 
                     async for event in runner.run_async(
                         user_id=adk_session.user_id,
                         session_id=adk_session.id,
                         new_message=content,
-                        run_config=run_cfg,
-                        abort_signal=abort_event,
+                        run_config=run_config,
+                        abort_signal=abort_signal,
                     ):
-                        if abort_event.is_set():
+                        if active.cancel_requested.is_set():
                             break
 
-                        # Intermediate events contain delta chunks
-                        if not event.is_final_response() and event.content and event.content.parts:
-                            for p in event.content.parts:
-                                if p.text:
-                                    full_text += p.text
-                                    q.put(json.dumps({"type": "chunk", "text": p.text}))
+                        if event.content and event.content.parts:
+                            for part in event.content.parts:
+                                if part.text and not event.is_final_response():
+                                    full_text += part.text
+                                    event_queue.put({
+                                        "type": "chunk",
+                                        "text": part.text,
+                                    })
 
-                        # Final event marks end of turn
-                        elif event.is_final_response():
-                            q.put(json.dumps({"type": "done", "full_text": full_text}))
+                        if event.is_final_response():
+                            final_response_seen = True
+
+                    if active.cancel_requested.is_set() or abort_signal.is_set():
+                        event_queue.put({"type": "cancelled"})
+                    else:
+                        event_queue.put({
+                            "type": "done",
+                            "full_text": full_text,
+                        })
+
+                    if not final_response_seen and not active.cancel_requested.is_set():
+                        logger.warning(
+                            "ADK stream ended without a final response for session %s",
+                            session_id,
+                        )
 
                 except Exception as exc:
-                    logger.error("Error during streaming generation: %s", exc, exc_info=True)
-                    q.put(json.dumps({"type": "error", "error": str(exc)}))
+                    if active.cancel_requested.is_set():
+                        event_queue.put({"type": "cancelled"})
+                    else:
+                        logger.exception("Error during streaming generation")
+                        event_queue.put({
+                            "type": "error",
+                            "error": "The assistant encountered an error. Please try again.",
+                        })
                 finally:
-                    with aborts_lock:
-                        active_aborts.pop(session_id, None)
-                    q.put(sentinel)
+                    remove_active_run(session_id, active)
+                    event_queue.put(sentinel)
 
-            asyncio.run(run())
+            try:
+                asyncio.run(run_agent())
+            except Exception:
+                logger.exception("Streaming worker failed")
+                remove_active_run(session_id, active)
+                event_queue.put({
+                    "type": "error",
+                    "error": "The assistant could not complete this response.",
+                })
+                event_queue.put(sentinel)
 
-        thread = threading.Thread(target=worker, daemon=True)
-        thread.start()
+        worker_thread = threading.Thread(
+            target=worker,
+            name=f"waku-stream-{session_id[:24]}",
+            daemon=True,
+        )
+        worker_thread.start()
 
         try:
             while True:
-                item = q.get()
+                try:
+                    item = event_queue.get(timeout=15)
+                except queue.Empty:
+                    # Heartbeat keeps proxies from closing an idle SSE stream
+                    # and gives the server regular opportunities to notice disconnects.
+                    yield ": keep-alive\n\n"
+                    continue
+
                 if item is sentinel:
                     break
-                yield f"data: {item}\n\n"
-        except GeneratorExit:
-            # Client disconnected or cancelled fetch
-            abort_event.set()
-            with aborts_lock:
-                active_aborts.pop(session_id, None)
 
-    return Response(
-        generate_events(),
+                yield make_sse(item)
+
+        except GeneratorExit:
+            # Browser closed the stream or its fetch was aborted.
+            request_cancellation(session_id)
+            raise
+        finally:
+            # Also cancel if the response is closed for any other reason.
+            if active_runs.get(session_id) is active:
+                request_cancellation(session_id)
+
+    response = Response(
+        stream_with_context(generate_events()),
         mimetype="text/event-stream",
         headers={
-            "Cache-Control": "no-cache",
+            "Cache-Control": "no-cache, no-transform",
             "X-Accel-Buffering": "no",
             "Connection": "keep-alive",
         },
     )
+    response.timeout = None
+    return response
 
+
+# ---------------------------------------------------------------------------
+# Stop endpoint
+# ---------------------------------------------------------------------------
 
 @app.route("/chat/stop", methods=["POST"])
 def chat_stop():
-    """Cancels active response generation for a given session."""
+    """Stop the currently running generation for the supplied session."""
     data = request.get_json(silent=True) or {}
-    session_id = data.get("session_id", "").strip()
+    session_id = str(data.get("session_id") or "").strip()
 
-    with aborts_lock:
-        abort_ev = active_aborts.get(session_id)
-        if abort_ev:
-            abort_ev.set()
-            logger.info("Session %s aborted via /chat/stop", session_id)
-            return jsonify({"status": "cancelled", "session_id": session_id})
+    if not session_id:
+        return jsonify({
+            "status": "error",
+            "error": "session_id is required.",
+        }), 400
 
-    return jsonify({"status": "not_active", "session_id": session_id})
+    if request_cancellation(session_id):
+        logger.info("Cancellation requested for session %s", session_id)
+        return jsonify({
+            "status": "cancellation_requested",
+            "session_id": session_id,
+        }), 200
+
+    return jsonify({
+        "status": "not_active",
+        "session_id": session_id,
+    }), 200
+
+
+# ---------------------------------------------------------------------------
+# Health check and local startup
+# ---------------------------------------------------------------------------
+
+@app.route("/health", methods=["GET"])
+def health():
+    return jsonify({
+        "status": "ok",
+        "agent_ready": runner is not None,
+        "active_streams": len(active_runs),
+    })
 
 
 if __name__ == "__main__":
     import argparse
 
     parser = argparse.ArgumentParser(description="Run Waku AI Companion server")
-    parser.add_argument("--port", "-p", type=int, default=None, help="Port to run on (default: 5000 or $PORT)")
-    parser.add_argument("--host", type=str, default=None, help="Host to bind to (default: 0.0.0.0 or $HOST)")
-    parser.add_argument("pos_port", nargs="?", type=int, default=None, help="Optional positional port (e.g. python app.py 8080)")
+    parser.add_argument("--port", "-p", type=int, default=None)
+    parser.add_argument("--host", type=str, default=None)
+    parser.add_argument("pos_port", nargs="?", type=int, default=None)
     args, _ = parser.parse_known_args()
 
     host = args.host or os.environ.get("HOST", "0.0.0.0")
     port = args.port or args.pos_port or int(os.environ.get("PORT", 5000))
     debug = os.environ.get("FLASK_DEBUG", "false").lower() in ("true", "1", "t")
 
-    logger.info("Starting Waku AI server on %s:%d (debug=%s)", host, port, debug)
-    app.run(host=host, port=port, debug=debug)
+    logger.info(
+        "Starting Waku AI server on %s:%d (debug=%s)",
+        host,
+        port,
+        debug,
+    )
+    app.run(host=host, port=port, debug=debug, threaded=True)
