@@ -3,29 +3,64 @@
 <head>
     <meta charset="UTF-8">
     <meta name="viewport" content="width=device-width, initial-scale=1.0">
-    <title>WakuWaku</title>
+    <title>🐾 Waku AI — Companion by Aryan Srivastava</title>
     <link rel="stylesheet" href="/static/style.css">
     <link rel="preconnect" href="https://fonts.googleapis.com">
     <link rel="preconnect" href="https://fonts.gstatic.com" crossorigin>
     <link href="https://fonts.googleapis.com/css2?family=Inter:wght@400;500;600;700&display=swap" rel="stylesheet">
 </head>
 <body>
-    <div class="chat-container">
+    <main class="chat-container">
+        <!-- Top Header & Mascot Bar -->
         <header class="chat-header">
-            <h1>AI Companion</h1>
+            <div class="header-content">
+                <div class="avatar-wrapper" title="Waku Mascot">
+                    <img id="character-image" src="/static/images/char-mouth-closed.png" alt="Waku AI Mascot">
+                </div>
+                <div class="header-text">
+                    <h1>🐾 Waku AI</h1>
+                    <p class="chat-subtitle">Created by Aryan Srivastava &bull; Powered by Google ADK</p>
+                </div>
+                <div class="header-controls">
+                    <label for="voice-select" class="sr-only">Voice Selection</label>
+                    <select id="voice-select" aria-label="Select Voice" title="Select Speech Voice"></select>
+                </div>
+            </div>
         </header>
-        <div class="character-viewer">
-            <img id="character-image" src="/static/images/char-mouth-closed.png" alt="WakuWaku">
-        </div>
-        <p id="status">Ask me something!</p>
+
+        <!-- Scrollable Chat Message History -->
+        <section id="chat-messages" class="chat-messages" role="log" aria-live="polite" aria-label="Conversation History">
+            <div class="message-row waku-row">
+                <div class="message-bubble waku-bubble">
+                    Hello! I'm Waku, an AI companion created by Aryan Srivastava. How can I help you today?
+                </div>
+            </div>
+        </section>
+
+        <!-- Fixed Bottom Input Area -->
         <footer class="chat-input-area">
-            <select id="voice-select"></select>
-            <textarea id="text-input" placeholder="Ask me anything..."></textarea>
-            <button id="send-button">
-                <svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 24 24" fill="currentColor" width="24px" height="24px"><path d="M2.01 21L23 12 2.01 3 2 10l15 2-15 2z"/></svg>
-            </button>
+            <div class="input-wrapper">
+                <label for="text-input" class="sr-only">Type your message</label>
+                <textarea id="text-input" placeholder="Type a message or ask a question..." rows="1" aria-label="Type your message"></textarea>
+
+                <!-- Stop Generation Button (visible while generating) -->
+                <button id="stop-button" class="btn-control btn-stop" type="button" aria-label="Stop response" title="Stop generating" style="display: none;">
+                    <svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 24 24" fill="currentColor" width="18px" height="18px" aria-hidden="true">
+                        <rect x="5" y="5" width="14" height="14" rx="2" />
+                    </svg>
+                    <span class="btn-label">Stop</span>
+                </button>
+
+                <!-- Send Message Button (visible when idle) -->
+                <button id="send-button" class="btn-control btn-send" type="button" aria-label="Send message" title="Send message">
+                    <svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 24 24" fill="currentColor" width="20px" height="20px" aria-hidden="true">
+                        <path d="M2.01 21L23 12 2.01 3 2 10l15 2-15 2z"/>
+                    </svg>
+                </button>
+            </div>
         </footer>
-    </div>
+    </main>
+
     <script src="/static/app.js"></script>
 </body>
 </html>

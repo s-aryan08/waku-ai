@@ -1,26 +1,49 @@
-# Byte-code files
-*.pyc
+# Byte-code & cache
 __pycache__/
+*.py[cod]
+*$py.class
+*.so
 
-# Distribution / packaging
-.Python
+# Virtual Environments
+.venv
+.venv/
+venv
+venv/
+env
+env/
+ENV/
+env.bak/
+venv.bak/
+
+# Environment Variables & Secrets
+.env
+.env.*
+!.env.example
+*.key
+*.pem
+*key*.txt
+project_id.txt
+
+# Editor and OS files
+.DS_Store
+.DS_Store?
+._*
+.Spotlight-V100
+.Trashes
+ehthumbs.db
+Thumbs.db
+.idea/
+.vscode/
+*.swp
+*.swo
+
+# Testing & Logs
+.pytest_cache/
+*.log
+*.sqlite3
+
+# Agent & build directories
+.agents/
 build/
 dist/
 *.egg-info/
-
-# Environments
-.env
-venv/
-env/
-
-# Editors
-.vscode/
-.idea/
-
-# Testing
-.pytest_cache/
-
-# Miscellaneous
-.DS_Store
-*.log
-*.sqlite3'
